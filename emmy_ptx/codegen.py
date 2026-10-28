@@ -241,6 +241,11 @@ class PTXCodeGen:
         if isinstance(expr, Builtin):
             b_name = expr.name
             mapping = {
+                "threadIdx.x": "tid.x", "threadIdx.y": "tid.y", "threadIdx.z": "tid.z",
+                "blockIdx.x": "ctaid.x", "blockIdx.y": "ctaid.y", "blockIdx.z": "ctaid.z",
+                "blockDim.x": "ntid.x", "blockDim.y": "ntid.y", "blockDim.z": "ntid.z",
+                "gridDim.x": "nctaid.x", "gridDim.y": "nctaid.y", "gridDim.z": "nctaid.z",
+                # Accept snake-case aliases used by some generated IR fixtures.
                 "thread_idx.x": "tid.x", "thread_idx.y": "tid.y", "thread_idx.z": "tid.z",
                 "block_idx.x": "ctaid.x", "block_idx.y": "ctaid.y", "block_idx.z": "ctaid.z",
                 "block_dim.x": "ntid.x", "block_dim.y": "ntid.y", "block_dim.z": "ntid.z",
@@ -384,7 +389,9 @@ class PTXCodeGen:
             pass
         elif st_name == "Sync":
             if stmt.warp:
-                self.builder.emit("bar.warp.sync 0xffffffff;")
+                r_mask = self.builder.fresh_b32()
+                self.builder.emit(f"activemask.b32 {r_mask};")
+                self.builder.emit(f"bar.warp.sync {r_mask};")
             elif stmt.count is None:
                 self.builder.emit(f"bar.sync {stmt.barrier_id};")
             else:
@@ -947,7 +954,12 @@ class PTXCodeGen:
             self.buffer_ptrs[name] = rd_ptr
 
         # Preamble: Load builtins
-        for b_name in ("tid.x", "tid.y", "tid.z", "ctaid.x", "ctaid.y", "ctaid.z", "ntid.x", "ntid.y", "ntid.z", "nctaid.x"):
+        for b_name in (
+            "tid.x", "tid.y", "tid.z",
+            "ctaid.x", "ctaid.y", "ctaid.z",
+            "ntid.x", "ntid.y", "ntid.z",
+            "nctaid.x", "nctaid.y", "nctaid.z",
+        ):
             r_b = self.builder.fresh_b32()
             self.builder.emit(f"mov.u32 {r_b}, %{b_name};")
             self.symtab[b_name] = r_b

@@ -85,16 +85,12 @@ def inspect_ir(ir_path: Path | str) -> KernelInspection:
                 None,
             )
         if raw_kernel_node is None:
-            # Fallback: take the first KernelOp in the raw JSON
-            k_nodes = [node for node in raw_json.get("nodes", {}).values() if node.get("op") == "KernelOp"]
-            if k_nodes:
-                raw_kernel_node = k_nodes[0]
+            raise ValueError(f"Could not recover serialized KernelOp inputs for {entry_name!r}")
 
-        if raw_kernel_node is not None and "inputs" in raw_kernel_node:
-            raw_inputs = raw_kernel_node.get("inputs", [])
-            arg_order = list(raw_inputs) + [t.name for t in kernel_node.outputs]
-        else:
-            arg_order = list(kernel_op.inputs) + [t.name for t in kernel_node.outputs]
+        raw_inputs = raw_kernel_node.get("inputs")
+        if not isinstance(raw_inputs, (dict, list, tuple)):
+            raise ValueError(f"KernelOp inputs missing or malformed for {entry_name!r}")
+        arg_order = list(raw_inputs) + [t.name for t in kernel_node.outputs]
 
     # Collect buffer shapes
     def _to_int(d):
