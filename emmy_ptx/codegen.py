@@ -5,7 +5,18 @@ import math
 from typing import Any
 from pathlib import Path
 
-from emmy.compiler.ir.expr import Expr, Literal, Var, BinaryExpr, TernaryExpr, SimplifyCtx
+from emmy.compiler.ir.expr import (
+    Expr,
+    Literal,
+    Var,
+    BinaryExpr,
+    TernaryExpr,
+    SimplifyCtx,
+    Builtin,
+    FuncCallExpr,
+    CastExpr,
+    FlatIndex,
+)
 from emmy.compiler.ir.kernel.ir import (
     KernelOp,
     Tile,
@@ -43,6 +54,49 @@ class PTXCodeGen:
         self.buffer_ptrs: dict[str, str] = {}
         self.smem_base_regs: dict[str, str] = {}
         self.buffer_shapes = dict(inspection.buffer_shapes)
+        self.tile_active_pred: str | None = None
+        self.tile_identity_smem_writes: dict[str, set[str]] = {}
+
+    @staticmethod
+    def _walk_statements(statements: Any):
+        """Walk nested statement bodies without depending on Emmy internals."""
+        for stmt in statements:
+            yield stmt
+            for field in ("body", "else_body", "combine_states"):
+                nested = getattr(stmt, field, ())
+                if isinstance(nested, (tuple, list)):
+                    yield from PTXCodeGen._walk_statements(nested)
+
+    @classmethod
+    def _contains_collective(cls, statements: Any) -> bool:
+        collective_types = {"Sync", "WarpShuffle", "TreeHalve", "CpAsyncCommit", "CpAsyncWait"}
+        return any(type(stmt).__name__ in collective_types for stmt in cls._walk_statements(statements))
+
+    @classmethod
+    def _tree_state_writes(cls, statements: Any) -> dict[str, set[str]]:
+        """Find shared reduction slots that must receive identity values from padded threads."""
+        result: dict[str, set[str]] = {}
+        for stmt in cls._walk_statements(statements):
+            if type(stmt).__name__ == "TreeHalve":
+                for buf, state in zip(stmt.bufs, stmt.state):
+                    result.setdefault(buf, set()).add(state)
+        return result
+
+    def _emit_global_load(self, dst: str, addr: str) -> None:
+        if self.tile_active_pred is None:
+            self.builder.emit(f"ld.global.f32 {dst}, [{addr}];")
+            return
+        # PTX leaves a predicated-off destination unchanged, so give padded
+        # lanes a harmless value. Their Accum instructions are predicated too.
+        self.builder.emit(f"mov.f32 {dst}, 0f00000000;")
+        self.builder.emit(f"@{self.tile_active_pred} ld.global.f32 {dst}, [{addr}];")
+
+    def _emit_shared_load(self, dst: str, addr: str) -> None:
+        if self.tile_active_pred is None:
+            self.builder.emit(f"ld.shared.f32 {dst}, [{addr}];")
+            return
+        self.builder.emit(f"mov.f32 {dst}, 0f00000000;")
+        self.builder.emit(f"@{self.tile_active_pred} ld.shared.f32 {dst}, [{addr}];")
 
     def lower_expr_to_b32(self, expr: Expr | int | float) -> str:
         """Evaluate an integer/index expression into a 32-bit register (%r)."""
@@ -181,6 +235,89 @@ class PTXCodeGen:
                 self.builder.emit(f"selp.b32 {dst}, {val_t}, {val_f}, {p_cond};")
             return dst
 
+        if isinstance(expr, FlatIndex):
+            return self.flatten_index_to_reg(expr.buffer, expr.index)
+
+        if isinstance(expr, Builtin):
+            b_name = expr.name
+            mapping = {
+                "thread_idx.x": "tid.x", "thread_idx.y": "tid.y", "thread_idx.z": "tid.z",
+                "block_idx.x": "ctaid.x", "block_idx.y": "ctaid.y", "block_idx.z": "ctaid.z",
+                "block_dim.x": "ntid.x", "block_dim.y": "ntid.y", "block_dim.z": "ntid.z",
+                "grid_dim.x": "nctaid.x", "grid_dim.y": "nctaid.y", "grid_dim.z": "nctaid.z",
+                "lane": "lane", "warp": "warp",
+            }
+            if b_name in mapping and mapping[b_name] in self.symtab:
+                return self.symtab[mapping[b_name]]
+            if b_name == "warp_size":
+                return "32"
+            if b_name in self.symtab:
+                return self.symtab[b_name]
+            raise KeyError(f"Builtin {b_name} not defined in symtab: {list(self.symtab.keys())}")
+
+        if isinstance(expr, CastExpr):
+            src_val = self.lower_expr(expr.expr)
+            dst_dtype = expr.dtype.name if hasattr(expr.dtype, "name") else str(expr.dtype)
+            is_src_float = (
+                isinstance(src_val, str) and (src_val.startswith("%f") or src_val.startswith("0f"))
+            )
+            if "int" in dst_dtype or "s32" in dst_dtype or "u32" in dst_dtype:
+                dst = target_reg or self.builder.fresh_b32()
+                if is_src_float:
+                    self.builder.emit(f"cvt.rzi.s32.f32 {dst}, {src_val};")
+                else:
+                    self.builder.emit(f"mov.b32 {dst}, {src_val};")
+                return dst
+            else:
+                dst = target_reg or self.builder.fresh_f32()
+                if not is_src_float:
+                    self.builder.emit(f"cvt.rn.f32.s32 {dst}, {src_val};")
+                else:
+                    self.builder.emit(f"mov.f32 {dst}, {src_val};")
+                return dst
+
+        if isinstance(expr, FuncCallExpr):
+            fn = expr.name
+            args = [self.lower_expr(a) for a in expr.args]
+            dst = target_reg or self.builder.fresh_f32()
+            if fn in ("exp", "exp_fast", "expf", "__expf"):
+                tmp = self.builder.fresh_f32()
+                self.builder.emit(f"mul.f32 {tmp}, {args[0]}, 0f3FB8AA3B;")
+                self.builder.emit(f"ex2.approx.ftz.f32 {dst}, {tmp};")
+            elif fn in ("sqrt", "sqrtf"):
+                self.builder.emit(f"sqrt.approx.ftz.f32 {dst}, {args[0]};")
+            elif fn in ("rsqrt", "rsqrtf"):
+                self.builder.emit(f"rsqrt.approx.ftz.f32 {dst}, {args[0]};")
+            elif fn in ("fmax", "fmaxf", "max", "maximum"):
+                self.builder.emit(f"max.f32 {dst}, {args[0]}, {args[1]};")
+            elif fn in ("fmin", "fminf", "min", "minimum"):
+                self.builder.emit(f"min.f32 {dst}, {args[0]}, {args[1]};")
+            elif fn in ("fabs", "fabsf", "abs"):
+                self.builder.emit(f"abs.f32 {dst}, {args[0]};")
+            elif fn in ("sin", "sinf"):
+                self.builder.emit(f"sin.approx.f32 {dst}, {args[0]};")
+            elif fn in ("cos", "cosf"):
+                self.builder.emit(f"cos.approx.f32 {dst}, {args[0]};")
+            elif fn in ("tanh", "tanhf"):
+                self.builder.emit(f"tanh.approx.f32 {dst}, {args[0]};")
+            elif fn in ("log", "logf"):
+                tmp = self.builder.fresh_f32()
+                self.builder.emit(f"lg2.approx.ftz.f32 {tmp}, {args[0]};")
+                self.builder.emit(f"mul.f32 {dst}, {tmp}, 0f3F317218;")
+            elif fn in ("pow", "powf"):
+                lg_x = self.builder.fresh_f32()
+                self.builder.emit(f"lg2.approx.ftz.f32 {lg_x}, {args[0]};")
+                ylg_x = self.builder.fresh_f32()
+                self.builder.emit(f"mul.f32 {ylg_x}, {args[1]}, {lg_x};")
+                self.builder.emit(f"ex2.approx.ftz.f32 {dst}, {ylg_x};")
+            elif fn == "bitwise_count":
+                dst_b = target_reg or self.builder.fresh_b32()
+                self.builder.emit(f"popc.b32 {dst_b}, {args[0]};")
+                return dst_b
+            else:
+                raise NotImplementedError(f"FuncCallExpr {fn!r} not supported: {expr}")
+            return dst
+
         raise NotImplementedError(f"Expression type {type(expr).__name__} not supported: {expr}")
 
     def _flatten_index_expr(self, buf_name: str, indices: tuple) -> Any:
@@ -246,16 +383,27 @@ class PTXCodeGen:
             # Handled in preamble/setup
             pass
         elif st_name == "Sync":
-            self.builder.emit("bar.sync 0;")
+            if stmt.warp:
+                self.builder.emit("bar.warp.sync 0xffffffff;")
+            elif stmt.count is None:
+                self.builder.emit(f"bar.sync {stmt.barrier_id};")
+            else:
+                self.builder.emit(f"bar.sync {stmt.barrier_id}, {stmt.count};")
         elif st_name == "WarpShuffle":
             self._lower_warp_shuffle(stmt)
         elif st_name == "TreeHalve":
             self._lower_tree_halve(stmt)
         elif st_name == "CpAsyncCopy":
             self._lower_cp_async_copy(stmt)
-        elif st_name in ("CpAsyncCommit", "CpAsyncWait"):
-            # Synchronous copy bypass makes commit & wait no-ops
+        elif st_name in ("CpAsyncCommit", "CpAsyncWait", "SetMaxNReg"):
+            # Synchronous copy bypass makes commit & wait no-ops; register allocation is handled by ptxas
             pass
+        elif st_name == "Select":
+            from emmy.compiler.ir.stmt.leaves import select_to_ternary
+            expr = select_to_ternary(stmt)
+            dst = self.symtab.get(stmt.name) or self.builder.fresh_f32()
+            self.symtab[stmt.name] = dst
+            self.lower_expr(expr, target_reg=dst)
         else:
             raise NotImplementedError(f"Statement type {st_name} not supported: {stmt}")
 
@@ -282,11 +430,22 @@ class PTXCodeGen:
         n = tile.n_elements
         guard = (tile.aux_threads != 0) or (n % tile.cells != 0)
         l_tile_end = None
+        old_tile_active_pred = self.tile_active_pred
+        old_identity_smem_writes = self.tile_identity_smem_writes
+        needs_collective_participation = guard and self._contains_collective(tile.body)
         if guard:
-            l_tile_end = self.builder.fresh_label("TILE_END")
-            p_guard = self.builder.fresh_pred()
-            self.builder.emit(f"setp.ge.s32 {p_guard}, {r_gid}, {n};")
-            self.builder.emit(f"@{p_guard} bra {l_tile_end};")
+            if needs_collective_participation:
+                # Padded threads in reductions still need to execute shuffles
+                # and CTA barriers. Track their logical validity and predicate
+                # memory effects/accumulation instead of branching past them.
+                self.tile_active_pred = self.builder.fresh_pred()
+                self.builder.emit(f"setp.lt.s32 {self.tile_active_pred}, {r_gid}, {n};")
+                self.tile_identity_smem_writes = self._tree_state_writes(tile.body)
+            else:
+                l_tile_end = self.builder.fresh_label("TILE_END")
+                p_guard = self.builder.fresh_pred()
+                self.builder.emit(f"setp.ge.s32 {p_guard}, {r_gid}, {n};")
+                self.builder.emit(f"@{p_guard} bra {l_tile_end};")
 
         # Decode axes with raster support
         extents = [int(a.extent.as_static()) for a in tile.axes]
@@ -363,6 +522,9 @@ class PTXCodeGen:
 
         if guard and l_tile_end is not None:
             self.builder.emit_label(l_tile_end)
+        if needs_collective_participation:
+            self.tile_active_pred = old_tile_active_pred
+            self.tile_identity_smem_writes = old_identity_smem_writes
 
     def _lower_strided_loop(self, loop: StridedLoop) -> None:
         # Pre-seed accumulators if requested
@@ -467,7 +629,7 @@ class PTXCodeGen:
                 dst = self.symtab.get(nm) or self.builder.fresh_f32()
                 self.symtab[nm] = dst
                 offset_str = f" + {4 * k}" if k > 0 else ""
-                self.builder.emit(f"ld.shared.f32 {dst}, [{r_addr}{offset_str}];")
+                self._emit_shared_load(dst, f"{r_addr}{offset_str}")
         else:
             rd_base = self.buffer_ptrs[load.input]
             rd_off = self.builder.fresh_b64()
@@ -478,7 +640,7 @@ class PTXCodeGen:
                 dst = self.symtab.get(nm) or self.builder.fresh_f32()
                 self.symtab[nm] = dst
                 offset_str = f" + {4 * k}" if k > 0 else ""
-                self.builder.emit(f"ld.global.f32 {dst}, [{rd_addr}{offset_str}];")
+                self._emit_global_load(dst, f"{rd_addr}{offset_str}")
 
     def _lower_write(self, write: Write) -> None:
         r_idx = self.flatten_index_to_reg(write.output, write.index)
@@ -491,7 +653,14 @@ class PTXCodeGen:
             for k, val_nm in enumerate(write.values):
                 val_reg = self.symtab[val_nm]
                 offset_str = f" + {4 * k}" if k > 0 else ""
-                self.builder.emit(f"st.shared.f32 [{r_addr}{offset_str}], {val_reg};")
+                # Padded reduction warps contribute the accumulator identity
+                # to TreeHalve's shared-memory tree. Other shared stores from
+                # padded threads must remain inactive.
+                identity_store = (
+                    val_nm in self.tile_identity_smem_writes.get(write.output, set())
+                )
+                pred = "" if identity_store or self.tile_active_pred is None else f"@{self.tile_active_pred} "
+                self.builder.emit(f"{pred}st.shared.f32 [{r_addr}{offset_str}], {val_reg};")
         else:
             rd_base = self.buffer_ptrs[write.output]
             rd_off = self.builder.fresh_b64()
@@ -501,11 +670,12 @@ class PTXCodeGen:
             for k, val_nm in enumerate(write.values):
                 val_reg = self.symtab[val_nm]
                 offset_str = f" + {4 * k}" if k > 0 else ""
+                pred = "" if self.tile_active_pred is None else f"@{self.tile_active_pred} "
                 if write.atomic:
                     dummy = self.builder.fresh_f32()
-                    self.builder.emit(f"atom.global.add.f32 {dummy}, [{rd_addr}{offset_str}], {val_reg};")
+                    self.builder.emit(f"{pred}atom.global.add.f32 {dummy}, [{rd_addr}{offset_str}], {val_reg};")
                 else:
-                    self.builder.emit(f"st.global.f32 [{rd_addr}{offset_str}], {val_reg};")
+                    self.builder.emit(f"{pred}st.global.f32 [{rd_addr}{offset_str}], {val_reg};")
 
     def _lower_assign(self, assign: Assign) -> None:
         dst = self.symtab.get(assign.name) or self.builder.fresh_f32()
@@ -535,14 +705,59 @@ class PTXCodeGen:
             tmp = self.builder.fresh_f32()
             self.builder.emit(f"mul.f32 {tmp}, {args[0]}, 0f3FB8AA3B;")
             self.builder.emit(f"ex2.approx.ftz.f32 {dst}, {tmp};")
-        elif op == "copy":
+        elif op == "rsqrt":
+            self.builder.emit(f"rsqrt.approx.ftz.f32 {dst}, {args[0]};")
+        elif op == "copy" or op == "pad":
             self.builder.emit(f"mov.f32 {dst}, {args[0]};")
-        elif op == "negate":
+        elif op in ("negate", "negative"):
             self.builder.emit(f"neg.f32 {dst}, {args[0]};")
         elif op == "abs":
             self.builder.emit(f"abs.f32 {dst}, {args[0]};")
+        elif op == "sin":
+            self.builder.emit(f"sin.approx.f32 {dst}, {args[0]};")
+        elif op == "cos":
+            self.builder.emit(f"cos.approx.f32 {dst}, {args[0]};")
+        elif op == "tanh":
+            self.builder.emit(f"tanh.approx.f32 {dst}, {args[0]};")
+        elif op == "log":
+            tmp = self.builder.fresh_f32()
+            self.builder.emit(f"lg2.approx.ftz.f32 {tmp}, {args[0]};")
+            self.builder.emit(f"mul.f32 {dst}, {tmp}, 0f3F317218;")
+        elif op == "square":
+            self.builder.emit(f"mul.f32 {dst}, {args[0]}, {args[0]};")
+        elif op == "sigmoid":
+            neg_x = self.builder.fresh_f32()
+            self.builder.emit(f"neg.f32 {neg_x}, {args[0]};")
+            tmp = self.builder.fresh_f32()
+            self.builder.emit(f"mul.f32 {tmp}, {neg_x}, 0f3FB8AA3B;")
+            exp_neg = self.builder.fresh_f32()
+            self.builder.emit(f"ex2.approx.ftz.f32 {exp_neg}, {tmp};")
+            denom = self.builder.fresh_f32()
+            self.builder.emit(f"add.f32 {denom}, {exp_neg}, 0f3F800000;")
+            self.builder.emit(f"rcp.approx.ftz.f32 {dst}, {denom};")
+        elif op == "silu":
+            neg_x = self.builder.fresh_f32()
+            self.builder.emit(f"neg.f32 {neg_x}, {args[0]};")
+            tmp = self.builder.fresh_f32()
+            self.builder.emit(f"mul.f32 {tmp}, {neg_x}, 0f3FB8AA3B;")
+            exp_neg = self.builder.fresh_f32()
+            self.builder.emit(f"ex2.approx.ftz.f32 {exp_neg}, {tmp};")
+            denom = self.builder.fresh_f32()
+            self.builder.emit(f"add.f32 {denom}, {exp_neg}, 0f3F800000;")
+            sig = self.builder.fresh_f32()
+            self.builder.emit(f"rcp.approx.ftz.f32 {sig}, {denom};")
+            self.builder.emit(f"mul.f32 {dst}, {args[0]}, {sig};")
+        elif op == "where":
+            p = self.builder.fresh_pred()
+            self.builder.emit(f"setp.ne.f32 {p}, {args[0]}, 0f00000000;")
+            self.builder.emit(f"selp.f32 {dst}, {args[1]}, {args[2]}, {p};")
         else:
-            raise NotImplementedError(f"Assign op {op!r} not supported: {assign}")
+            try:
+                from emmy.compiler.ir.stmt.leaves import op_to_expr
+                expr = op_to_expr(op, [Var(a) for a in assign.args], dtype=getattr(assign.dtype, "name", "f32"))
+                self.lower_expr(expr, target_reg=dst)
+            except Exception as e:
+                raise NotImplementedError(f"Assign op {op!r} not supported: {assign}") from e
 
     def _lower_let(self, let: Let) -> None:
         val_str = self.lower_expr(let.value)
@@ -565,15 +780,17 @@ class PTXCodeGen:
         rhs = self.symtab[accum.value]
         op = accum.op.name
         if op == "add":
-            self.builder.emit(f"add.f32 {dst}, {lhs}, {rhs};")
+            inst = f"add.f32 {dst}, {lhs}, {rhs};"
         elif op == "maximum":
-            self.builder.emit(f"max.f32 {dst}, {lhs}, {rhs};")
+            inst = f"max.f32 {dst}, {lhs}, {rhs};"
         elif op == "minimum":
-            self.builder.emit(f"min.f32 {dst}, {lhs}, {rhs};")
+            inst = f"min.f32 {dst}, {lhs}, {rhs};"
         elif op == "multiply":
-            self.builder.emit(f"mul.f32 {dst}, {lhs}, {rhs};")
+            inst = f"mul.f32 {dst}, {lhs}, {rhs};"
         else:
             raise NotImplementedError(f"Accum op {op!r} not supported: {accum}")
+        pred = "" if self.tile_active_pred is None else f"@{self.tile_active_pred} "
+        self.builder.emit(f"{pred}{inst}")
 
     def _lower_init(self, init: Init) -> None:
         dst = self.symtab.get(init.name) or self.builder.fresh_f32()
@@ -583,6 +800,8 @@ class PTXCodeGen:
     def _lower_warp_shuffle(self, ws: WarpShuffle) -> None:
         s = int(ws.length) // 2
         while s > 0:
+            r_mask = self.builder.fresh_b32()
+            self.builder.emit(f"activemask.b32 {r_mask};")
             for st, sb in zip(ws.state, ws.state_b):
                 r_st = self.symtab[st]
                 r_sb = self.symtab.get(sb) or self.builder.fresh_f32()
@@ -590,7 +809,7 @@ class PTXCodeGen:
                 r_tmp = self.builder.fresh_b32()
                 r_shfl = self.builder.fresh_b32()
                 self.builder.emit(f"mov.b32 {r_tmp}, {r_st};")
-                self.builder.emit(f"shfl.sync.bfly.b32 {r_shfl}, {r_tmp}, {s}, 0x1f, 0xffffffff;")
+                self.builder.emit(f"shfl.sync.bfly.b32 {r_shfl}, {r_tmp}, {s}, 0x1f, {r_mask};")
                 self.builder.emit(f"mov.b32 {r_sb}, {r_shfl};")
             for stmt in ws.combine_states:
                 self.lower_stmt(stmt)
@@ -640,7 +859,10 @@ class PTXCodeGen:
                 self.builder.emit(f"st.shared.f32 [{r_addr}], {self.symtab[st]};")
 
             self.builder.emit_label(l_skip)
-            self.builder.emit("bar.sync 0;")
+            if th.barrier_count is None:
+                self.builder.emit(f"bar.sync {th.barrier_id};")
+            else:
+                self.builder.emit(f"bar.sync {th.barrier_id}, {th.barrier_count};")
             h >>= 1
 
         # Broadcast reduced value from root (0) to every thread
@@ -680,7 +902,9 @@ class PTXCodeGen:
         for k in range(num_floats):
             tmp = self.builder.fresh_f32()
             offset_str = f" + {4 * k}" if k > 0 else ""
-            self.builder.emit(f"ld.global.f32 {tmp}, [{rd_addr}{offset_str}];")
+            self._emit_global_load(tmp, f"{rd_addr}{offset_str}")
+            # A masked synchronous cp.async fallback zero-fills the shared
+            # destination, matching the hardware copy's out-of-bounds form.
             self.builder.emit(f"st.shared.f32 [{r_smem_addr}{offset_str}], {tmp};")
 
     def generate_ptx(self) -> str:

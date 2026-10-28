@@ -42,7 +42,9 @@ def inspect_ir(ir_path: Path | str) -> KernelInspection:
     if not entry_name:
         entry_name = ir_path.stem.replace(".ir", "")
 
-    # Resolve arg_order: meta.json first, fallback to pure-Graph derivation
+    # Resolve arg_order: meta.json first, then preserve the serialized
+    # KernelOp input order. Graph.from_dict wraps inputs in a frozendict, whose
+    # iteration order is not the launch ABI order (e.g. x1, x0 in matmul IRs).
     arg_order = None
     meta_path = ir_path.parent / "meta.json"
     if meta_path.exists():
@@ -50,14 +52,49 @@ def inspect_ir(ir_path: Path | str) -> KernelInspection:
             meta = json.loads(meta_path.read_text())
             for k in meta.get("kernels", []):
                 if k.get("entry") == entry_name:
-                    arg_order = list(k.get("arg_order", []))
+                    candidate = list(k.get("arg_order", []))
+                    if candidate:
+                        arg_order = candidate
                     break
         except Exception:
             arg_order = None
 
     if arg_order is None:
-        # Exact fallback: inputs + outputs
-        arg_order = list(kernel_op.inputs) + [t.name for t in kernel_node.outputs]
+        # KernelOp inputs are serialized in the same order used by Emmy's
+        # CudaOp arg_order. Recover that insertion order from the JSON rather
+        # than from Graph's frozendict, which can reorder the names.
+        raw_kernel_node = next(
+            (
+                node
+                for node in raw_json.get("nodes", {}).values()
+                if node.get("op") == "KernelOp"
+                and node.get("op_fields", {}).get("name") == entry_name
+            ),
+            None,
+        )
+        if raw_kernel_node is None:
+            # Older IRs may leave KernelOp.name blank. Match its outputs.
+            output_names = {t.name for t in kernel_node.outputs}
+            raw_kernel_node = next(
+                (
+                    node
+                    for node in raw_json.get("nodes", {}).values()
+                    if node.get("op") == "KernelOp"
+                    and {t.get("name") for t in node.get("outputs", [])} == output_names
+                ),
+                None,
+            )
+        if raw_kernel_node is None:
+            # Fallback: take the first KernelOp in the raw JSON
+            k_nodes = [node for node in raw_json.get("nodes", {}).values() if node.get("op") == "KernelOp"]
+            if k_nodes:
+                raw_kernel_node = k_nodes[0]
+
+        if raw_kernel_node is not None and "inputs" in raw_kernel_node:
+            raw_inputs = raw_kernel_node.get("inputs", [])
+            arg_order = list(raw_inputs) + [t.name for t in kernel_node.outputs]
+        else:
+            arg_order = list(kernel_op.inputs) + [t.name for t in kernel_node.outputs]
 
     # Collect buffer shapes
     def _to_int(d):
